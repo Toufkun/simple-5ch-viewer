@@ -1,6 +1,5 @@
-// server.js — Simple 5ch Viewer (Render用 完成版)
-// 目的：subject.txt / dat / read.cgi を「必ず Cloudflare Worker 経由」で取得して403回避
-// 必要ENV：PROXY_URL（例: https://xxxxxx.workers.dev/）
+// server.js — Simple 5ch Viewer (Render用 完成版 / キャッシュバグ修正済)
+// 必要ENV：PROXY_URL（例: https://xxxx.workers.dev/）
 // 任意ENV：BASE_BOARD_URL（例: https://mi.5ch.net/news4vip/）
 
 const express = require('express');
@@ -34,16 +33,15 @@ const joinUrl = (base, path) =>
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
   const board = u.pathname.replace(/\/+$/,'').split('/').pop();
-  // モバイル互換で弾かれにくい
   return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/?guid=ON`;
 }
 
+// ★修正ポイント：status と data をセットでキャッシュ・返却
 async function getVia(url, { binary=false, timeout=15000 } = {}) {
-  // PROXY_URL があれば必ずプロキシ経由（403回避の要）
   const final = PROXY_URL ? `${PROXY_URL}?url=${encodeURIComponent(url)}` : url;
   const key = (binary ? 'bin:' : 'txt:') + final;
   const hit = cache.get(key);
-  if (hit) return hit;
+  if (hit) return hit; // {status, data}
 
   const res = await axios.get(final, {
     responseType: binary ? 'arraybuffer' : 'text',
@@ -51,9 +49,9 @@ async function getVia(url, { binary=false, timeout=15000 } = {}) {
     validateStatus: s => s >= 200 && s < 600
   });
 
-  // 200 のみキャッシュ
-  if (res.status === 200) cache.set(key, res.data);
-  return res;
+  const pack = { status: res.status, data: res.data };
+  if (res.status === 200) cache.set(key, pack);
+  return pack;
 }
 
 /* ===== 解析 ===== */
@@ -81,7 +79,6 @@ function parseReadCgiHtml(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
   const items = [];
 
-  // 代表的な構造（広めに拾う）
   $('article, .post, .postWrap, .postContainer, li.post, .res, .reply').each((i, el) => {
     const name = (
       $(el).find('.name').text() ||
@@ -131,14 +128,13 @@ function parseReadCgiHtml(html) {
     }
   }
 
-  // さらに保険：大枠からテキスト抽出
+  // 最終保険：大枠テキスト
   if (items.length === 0) {
     const bulk = $('#res, #thread, .thread, .thre, #main, #m, .content').first().text().trim();
     if (bulk) {
       return bulk.split(/\n{2,}/).map((t,i)=>({ no:i+1, name:'', dateId:'', body:t.trim() })).slice(0,200);
     }
   }
-
   return items;
 }
 
@@ -162,7 +158,7 @@ app.get('/', (_req, res) => {
 
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-/* ===== スレ一覧 ===== */
+/* ===== スレ一覧（subject.txt） ===== */
 app.get('/board', async (req, res) => {
   try {
     const base = (req.query.url || DEFAULT_BASE || '').trim();
@@ -188,7 +184,7 @@ app.get('/board', async (req, res) => {
   }
 });
 
-/* ===== スレ本文：dat優先 → ダメなら read.cgi ===== */
+/* ===== スレ本文：dat優先 → NGなら read.cgi ===== */
 app.get('/thread', async (req, res) => {
   try {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
@@ -247,7 +243,7 @@ app.get('/thread', async (req, res) => {
   }
 });
 
-/* ===== 診断（直叩きは行わず“必ずプロキシ経由”の状態を数値で確認） ===== */
+/* ===== 診断（必ずプロキシ経由の状態を数値で確認） ===== */
 app.get('/__diag', async (req, res) => {
   try {
     const base = (req.query.base || DEFAULT_BASE || '').trim();
