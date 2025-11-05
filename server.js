@@ -76,6 +76,13 @@ function parseDat(text) {
   });
 }
 
+function buildReadCgiUrl(base, dat) {
+  // base: https://mi.5ch.net/news4vip/ → boardName=news4vip
+  const u = new URL(base);
+  const boardName = u.pathname.replace(/\/+$/,'').split('/').pop();
+  return `${u.protocol}//${u.host}/test/read.cgi/${boardName}/${dat}/`;
+}
+
 // ===== 画面 =====
 app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
@@ -155,8 +162,21 @@ app.get('/thread', async (req, res) => {
     ${html || 'レスがありません'}`);
   } catch (e) {
     const msg = String(e.message || e);
-    if (msg.includes('DAT_404')) return res.status(404).send('このスレは落ちている可能性があります（dat 404）。/board に戻って別スレでお試しください。');
-    if (msg.includes('DAT_403')) return res.status(403).send('アクセスが拒否されました（403）。時間を置くかUA/Referer/Rangeを見直してください。');
+    if (msg.includes('DAT_404')) {
+      return res.status(404).send('このスレは落ちている可能性があります（dat 404）。/board に戻って別スレでお試しください。');
+    }
+    if (msg.includes('DAT_403')) {
+      // dat直取りが弾かれた → read.cgiへフォールバック
+      try {
+        const base = (req.query.base || DEFAULT_BASE || '').trim();
+        const dat  = (req.query.dat  || '').trim();
+        if (base && dat) {
+          const readUrl = buildReadCgiUrl(base, dat);
+          return res.redirect(readUrl);
+        }
+      } catch (_) {}
+      return res.status(403).send('アクセスが拒否されました（403）。read.cgi へのフォールバックに失敗しました。');
+    }
     res.status(500).send('取得に失敗しました: ' + he.escape(msg));
   }
 });
