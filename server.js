@@ -1,4 +1,4 @@
-// server.js
+// server.js  ── Simple 5ch Viewer (Render対応・同一ドメイン表示・403/IPv6対策 完成版)
 const express = require('express');
 const axios = require('axios');
 const iconv = require('iconv-lite');
@@ -6,16 +6,23 @@ const NodeCache = require('node-cache');
 const he = require('he');
 const rateLimit = require('express-rate-limit');
 const cheerio = require('cheerio');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 
-// ===== 基本設定 =====
+/* ===== 基本設定 ===== */
 const PORT = process.env.PORT || 3000;
 const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://asahi.5ch.net/newsplus/
-const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });  // 秒
+const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });   // 秒
+// 専ブラ互換UA（弾かれにくい）
 const UA = 'Monazilla/1.00 JaneStyle/4.0.0';
 
-// レート制限 & 軽いセキュリティ
+// RenderでIPv6経路が弾かれる対策としてIPv4固定
+const httpAgent = new http.Agent({ keepAlive: false, family: 4 });
+const httpsAgent = new https.Agent({ keepAlive: false, family: 4 });
+
+/* ===== レート制限 & 軽いセキュリティ ===== */
 app.use(rateLimit({ windowMs: 60 * 1000, max: 30 }));
 app.use((_, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -23,14 +30,14 @@ app.use((_, res, next) => {
   next();
 });
 
-// ===== ユーティリティ =====
+/* ===== ユーティリティ ===== */
 const joinUrl = (base, path) =>
   `${base.replace(/\/+$/,'')}/${path.replace(/^\/+/, '')}`;
 
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
-  const boardName = u.pathname.replace(/\/+$/,'').split('/').pop();
-  return `${u.protocol}//${u.host}/test/read.cgi/${boardName}/${dat}/`;
+  const board = u.pathname.replace(/\/+$/,'').split('/').pop();
+  return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/`;
 }
 
 async function fetchCP932(url, referer = DEFAULT_BASE) {
@@ -46,10 +53,15 @@ async function fetchCP932(url, referer = DEFAULT_BASE) {
       'Connection': 'close',
       // dat取得で重要
       'Range': 'bytes=0-',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Upgrade-Insecure-Requests': '1',
+      'DNT': '1',
       ...(referer ? { Referer: referer } : {})
     },
     timeout: 10000,
-    validateStatus: s => s >= 200 && s < 500 // 403/404も扱う
+    validateStatus: s => s >= 200 && s < 500, // 403/404も扱う
+    httpAgent, httpsAgent,
   });
 
   if (res.status === 404) throw new Error('DAT_404');
@@ -68,13 +80,18 @@ async function fetchUtf8(url, referer = DEFAULT_BASE) {
     responseType: 'text',
     headers: {
       'User-Agent': UA,
-      'Accept': 'text/html, */*;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'ja-JP,ja;q=0.9',
       'Connection': 'close',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Upgrade-Insecure-Requests': '1',
+      'DNT': '1',
       ...(referer ? { Referer: referer } : {})
     },
     timeout: 10000,
-    validateStatus: s => s >= 200 && s < 500
+    validateStatus: s => s >= 200 && s < 500,
+    httpAgent, httpsAgent,
   });
 
   if (res.status === 404) throw new Error('READCGI_404');
@@ -107,49 +124,55 @@ function parseDat(text) {
   });
 }
 
-// read.cgi のHTMLから本文を抽出して自サイトで描画
 function parseReadCgiHtml(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
-  // 5chのread.cgiは構造が一定ではないが、本文は <div class="post"> や <dt>/<dd> ペアにあることが多い
-  // ここでは汎用的に、レスっぽい塊を抽出する。
-  let items = [];
+  const items = [];
 
-  // パターン1: 5ch現行の <article> や .post-like を拾う
+  // 現行系のarticle/post
   $('article, .post, .postWrap').each((i, el) => {
     const name = ($(el).find('.name').text() || $(el).find('.name a').text() || '').trim();
     const dateId = ($(el).find('.date').text() || $(el).find('.info').text() || '').trim();
-    const bodyHtml = $(el).find('.message, .post-message, .body, .messageText').html() || $(el).find('blockquote').html() || $(el).html();
+    const bodyHtml =
+      $(el).find('.message, .post-message, .body, .messageText').html()
+      || $(el).find('blockquote').html()
+      || $(el).html();
     if (bodyHtml) {
       items.push({
         no: i + 1,
         name,
         dateId,
-        // HTML→テキスト寄りで描画（最低限の<br>→改行）
-        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
+        body: he.decode(
+          bodyHtml
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/?[^>]+>/g, '')
+        )
       });
     }
   });
 
-  // パターン2: 古い <dt>/<dd> 構造
+  // 古い dt/dd 構造
   if (items.length === 0) {
     const dts = $('dt');
     const dds = $('dd');
     for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
-      const head = $(dts[i]).text().trim(); // 番号 名前 日付ID など
+      const head = $(dts[i]).text().trim();
       const bodyHtml = $(dds[i]).html() || '';
       items.push({
         no: i + 1,
         name: head,
         dateId: '',
-        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
+        body: he.decode(
+          bodyHtml
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/?[^>]+>/g, '')
+        )
       });
     }
   }
-
   return items;
 }
 
-// ===== 画面 =====
+/* ===== 画面 ===== */
 app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
   <style>
@@ -167,7 +190,7 @@ app.get('/', (_req, res) => {
 
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// 板のスレ一覧（subject.txt）
+/* ===== スレ一覧（subject.txt） ===== */
 app.get('/board', async (req, res) => {
   try {
     const base = (req.query.url || DEFAULT_BASE || '').trim();
@@ -190,13 +213,13 @@ app.get('/board', async (req, res) => {
   }
 });
 
-// スレ本文（dat優先→失敗時read.cgiパース）
+/* ===== スレ本文（dat優先→失敗時read.cgiをサーバー側で解析） ===== */
 app.get('/thread', async (req, res) => {
   try {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
     let dat  = (req.query.dat  || '').trim();
 
-    // フォールバック: /thread?url=https://.../dat/12345.dat も受ける
+    // /thread?url=https://.../dat/12345.dat でもOK
     if ((!base || !dat) && req.query.url) {
       try {
         const u = new URL(req.query.url);
@@ -210,23 +233,25 @@ app.get('/thread', async (req, res) => {
 
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
-    // 1) dat直取得トライ
+    // 1) dat直取得
     try {
       const datUrl = joinUrl(base, `dat/${dat}.dat`);
       const datTxt = await fetchCP932(datUrl, base);
       const posts = parseDat(datTxt);
+
       const html = posts.map(p => `
         <article>
           <div><b>${p.no}</b> 名前：${he.escape(p.name)} <span class="muted">[${he.escape(p.dateId)}]</span></div>
           <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${p.body}</pre>
         </article>
       `).join('<hr>');
+
       return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(dat)</title>
       <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
       <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
       ${html || 'レスがありません'}`);
-    } catch (errDat) {
-      // 2) 失敗（403/404等）→ read.cgi をサーバー側で取得してパース
+    } catch (_errDat) {
+      // 2) read.cgi をサーバー側で取得し、外部遷移なしで描画
       const readUrl = buildReadCgiUrl(base, dat);
       const html = await fetchUtf8(readUrl, base);
       const posts = parseReadCgiHtml(html);
@@ -248,12 +273,42 @@ app.get('/thread', async (req, res) => {
   }
 });
 
-// デバッグ: 実際に取りに行くdat URL確認
+/* ===== デバッグ: 実際に取りに行くdat URL確認 ===== */
 app.get('/__debug_thread_url', (req, res) => {
   const base = (req.query.base || DEFAULT_BASE || '').trim();
   const dat  = (req.query.dat  || '').trim();
   if (!base || !dat) return res.status(400).send('base/dat 必須');
   res.type('text').send(joinUrl(base, `dat/${dat}.dat`));
+});
+
+/* ===== 診断: dat / read.cgi のHTTPステータス可視化 ===== */
+app.get('/__diag', async (req, res) => {
+  try {
+    const base = (req.query.base || DEFAULT_BASE || '').trim();
+    const dat  = (req.query.dat  || '').trim();
+    if (!base || !dat) return res.status(400).json({ error: 'need base & dat' });
+
+    const datUrl  = joinUrl(base, `dat/${dat}.dat`);
+    const readUrl = buildReadCgiUrl(base, dat);
+
+    const r1 = await axios.get(datUrl, {
+      responseType: 'arraybuffer',
+      headers: { 'User-Agent': UA, 'Range': 'bytes=0-', Referer: base },
+      timeout: 8000, validateStatus: s => true, httpAgent, httpsAgent,
+    }).then(r => ({ url: datUrl,  status: r.status, len: Number(r.headers['content-length']||0) }))
+      .catch(e => ({ url: datUrl,  error: String(e.message) }));
+
+    const r2 = await axios.get(readUrl, {
+      responseType: 'text',
+      headers: { 'User-Agent': UA, Referer: base },
+      timeout: 8000, validateStatus: s => true, httpAgent, httpsAgent,
+    }).then(r => ({ url: readUrl, status: r.status, len: Number(r.headers['content-length']||0) }))
+      .catch(e => ({ url: readUrl, error: String(e.message) }));
+
+    res.json({ dat: r1, readcgi: r2 });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message||e) });
+  }
 });
 
 app.listen(PORT, () => console.log('listening on :' + PORT));
