@@ -1,4 +1,8 @@
-// server.js  ── Simple 5ch Viewer (Render対応・同一ドメイン表示・403/IPv6対策 完成版)
+// server.js — Simple 5ch Viewer (Render用 完成版)
+// 目的：subject.txt / dat / read.cgi を「必ず Cloudflare Worker 経由」で取得して403回避
+// 必要ENV：PROXY_URL（例: https://xxxxxx.workers.dev/）
+// 任意ENV：BASE_BOARD_URL（例: https://mi.5ch.net/news4vip/）
+
 const express = require('express');
 const axios = require('axios');
 const iconv = require('iconv-lite');
@@ -6,23 +10,16 @@ const NodeCache = require('node-cache');
 const he = require('he');
 const rateLimit = require('express-rate-limit');
 const cheerio = require('cheerio');
-const http = require('http');
-const https = require('https');
 
 const app = express();
 
 /* ===== 基本設定 ===== */
 const PORT = process.env.PORT || 3000;
-const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://asahi.5ch.net/newsplus/
-const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });   // 秒
-// 専ブラ互換UA（弾かれにくい）
-const UA = 'Monazilla/1.00 JaneStyle/4.0.0';
+const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://mi.5ch.net/news4vip/
+const PROXY_URL = (process.env.PROXY_URL || '').replace(/\/+$/, ''); // 例: https://xxxx.workers.dev
+const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 }); // 秒
 
-// RenderでIPv6経路が弾かれる対策としてIPv4固定
-const httpAgent = new http.Agent({ keepAlive: false, family: 4 });
-const httpsAgent = new https.Agent({ keepAlive: false, family: 4 });
-
-/* ===== レート制限 & 軽いセキュリティ ===== */
+/* ===== 軽い防御 ===== */
 app.use(rateLimit({ windowMs: 60 * 1000, max: 30 }));
 app.use((_, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -37,74 +34,32 @@ const joinUrl = (base, path) =>
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
   const board = u.pathname.replace(/\/+$/,'').split('/').pop();
-  return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/`;
+  // モバイル互換で弾かれにくい
+  return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/?guid=ON`;
 }
 
-async function fetchCP932(url, referer = DEFAULT_BASE) {
-  const hit = cache.get(url);
+async function getVia(url, { binary=false, timeout=15000 } = {}) {
+  // PROXY_URL があれば必ずプロキシ経由（403回避の要）
+  const final = PROXY_URL ? `${PROXY_URL}?url=${encodeURIComponent(url)}` : url;
+  const key = (binary ? 'bin:' : 'txt:') + final;
+  const hit = cache.get(key);
   if (hit) return hit;
 
-  const res = await axios.get(url, {
-    responseType: 'arraybuffer',
-    headers: {
-      'User-Agent': UA,
-      'Accept': '*/*',
-      'Accept-Language': 'ja-JP,ja;q=0.9',
-      'Connection': 'close',
-      // dat取得で重要
-      'Range': 'bytes=0-',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Upgrade-Insecure-Requests': '1',
-      'DNT': '1',
-      ...(referer ? { Referer: referer } : {})
-    },
-    timeout: 10000,
-    validateStatus: s => s >= 200 && s < 500, // 403/404も扱う
-    httpAgent, httpsAgent,
+  const res = await axios.get(final, {
+    responseType: binary ? 'arraybuffer' : 'text',
+    timeout,
+    validateStatus: s => s >= 200 && s < 600
   });
 
-  if (res.status === 404) throw new Error('DAT_404');
-  if (res.status === 403) throw new Error('DAT_403');
-
-  const text = iconv.decode(Buffer.from(res.data), 'cp932'); // Shift_JIS/CP932
-  cache.set(url, text);
-  return text;
+  // 200 のみキャッシュ
+  if (res.status === 200) cache.set(key, res.data);
+  return res;
 }
 
-async function fetchUtf8(url, referer = DEFAULT_BASE) {
-  const hit = cache.get(url);
-  if (hit) return hit;
-
-  const res = await axios.get(url, {
-    responseType: 'text',
-    headers: {
-      'User-Agent': UA,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'ja-JP,ja;q=0.9',
-      'Connection': 'close',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Upgrade-Insecure-Requests': '1',
-      'DNT': '1',
-      ...(referer ? { Referer: referer } : {})
-    },
-    timeout: 10000,
-    validateStatus: s => s >= 200 && s < 500,
-    httpAgent, httpsAgent,
-  });
-
-  if (res.status === 404) throw new Error('READCGI_404');
-  if (res.status === 403) throw new Error('READCGI_403');
-
-  const html = typeof res.data === 'string' ? res.data : res.data.toString('utf8');
-  cache.set(url, html);
-  return html;
-}
-
-function parseSubjectTxt(text) {
+/* ===== 解析 ===== */
+function parseSubjectTxt(s) {
   // 1行: "1234567890.dat<>タイトル (123)"
-  return text.split('\n').filter(Boolean).map(line => {
+  return s.split('\n').filter(Boolean).map(line => {
     const [file, rest] = line.split('<>');
     if (!file || !rest) return null;
     const dat = file.replace('.dat', '');
@@ -117,10 +72,8 @@ function parseDat(text) {
   // 1行=1レス: "name<>mail<>dateID<>body<>title"
   return text.split('\n').filter(Boolean).map((line, i) => {
     const [name='', mail='', dateId='', bodyRaw=''] = line.split('<>');
-    const body = he.escape(bodyRaw)
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/&gt;&gt;(\d+)/g, '>>$1');
-    return { no: i + 1, name, mail, dateId, body };
+    const body = he.escape(bodyRaw).replace(/<br\s*\/?>/gi, '\n').replace(/&gt;&gt;(\d+)/g, '>>$1');
+    return { no: i + 1, name, dateId, body };
   });
 }
 
@@ -128,14 +81,27 @@ function parseReadCgiHtml(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
   const items = [];
 
-  // 現行系のarticle/post
-  $('article, .post, .postWrap').each((i, el) => {
-    const name = ($(el).find('.name').text() || $(el).find('.name a').text() || '').trim();
-    const dateId = ($(el).find('.date').text() || $(el).find('.info').text() || '').trim();
+  // 代表的な構造（広めに拾う）
+  $('article, .post, .postWrap, .postContainer, li.post, .res, .reply').each((i, el) => {
+    const name = (
+      $(el).find('.name').text() ||
+      $(el).find('.name a').text() ||
+      $(el).find('.username').text() ||
+      $(el).find('.poster').text() ||
+      ''
+    ).trim();
+    const dateId = (
+      $(el).find('.date').text() ||
+      $(el).find('.info').text() ||
+      $(el).find('.meta').text() ||
+      ''
+    ).trim();
     const bodyHtml =
-      $(el).find('.message, .post-message, .body, .messageText').html()
-      || $(el).find('blockquote').html()
-      || $(el).html();
+      $(el).find('.message, .post-message, .body, .messageText, .content, .message .text').html() ||
+      $(el).find('blockquote').html() ||
+      $(el).find('.mes, .msg, .resbody').html() ||
+      $(el).html();
+
     if (bodyHtml) {
       items.push({
         no: i + 1,
@@ -150,10 +116,9 @@ function parseReadCgiHtml(html) {
     }
   });
 
-  // 古い dt/dd 構造
+  // 古い dl 構造の保険
   if (items.length === 0) {
-    const dts = $('dt');
-    const dds = $('dd');
+    const dts = $('dt'); const dds = $('dd');
     for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
       const head = $(dts[i]).text().trim();
       const bodyHtml = $(dds[i]).html() || '';
@@ -161,14 +126,19 @@ function parseReadCgiHtml(html) {
         no: i + 1,
         name: head,
         dateId: '',
-        body: he.decode(
-          bodyHtml
-            .replace(/<br\s*\/?>/gi, '\n')
-            .replace(/<\/?[^>]+>/g, '')
-        )
+        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
       });
     }
   }
+
+  // さらに保険：大枠からテキスト抽出
+  if (items.length === 0) {
+    const bulk = $('#res, #thread, .thread, .thre, #main, #m, .content').first().text().trim();
+    if (bulk) {
+      return bulk.split(/\n{2,}/).map((t,i)=>({ no:i+1, name:'', dateId:'', body:t.trim() })).slice(0,200);
+    }
+  }
+
   return items;
 }
 
@@ -177,27 +147,32 @@ app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
   <style>
     body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;line-height:1.6;padding:16px;max-width:940px;margin:auto}
-    input,button{font-size:16px;padding:6px 10px}.muted{color:#666} a{word-break:break-all}
+    input,button{font-size:16px;padding:6px 10px}
+    .muted{color:#666} a{word-break:break-all}
   </style>
   <h1>Simple 5ch Viewer</h1>
-  <p class="muted">環境変数 <code>BASE_BOARD_URL</code> は ${DEFAULT_BASE ? '設定済み' : '未設定'}。</p>
+  <p class="muted">BASE_BOARD_URL: <code>${he.escape(DEFAULT_BASE || '(未設定)')}</code></p>
+  <p class="muted">PROXY_URL: <code>${he.escape(PROXY_URL || '(未設定)')}</code></p>
   <form action="/board" method="get">
     <label>板URL：</label><br>
-    <input name="url" placeholder="https://asahi.5ch.net/newsplus/" style="width:480px" value="${he.escape(DEFAULT_BASE)}">
+    <input name="url" placeholder="https://mi.5ch.net/news4vip/" style="width:480px" value="${he.escape(DEFAULT_BASE)}">
     <button>スレ一覧を表示</button>
   </form>`);
 });
 
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-/* ===== スレ一覧（subject.txt） ===== */
+/* ===== スレ一覧 ===== */
 app.get('/board', async (req, res) => {
   try {
     const base = (req.query.url || DEFAULT_BASE || '').trim();
     if (!base) return res.status(400).send('板URLが未設定です（?url= または BASE_BOARD_URL を設定）');
 
     const subjectUrl = joinUrl(base, 'subject.txt');
-    const subjectTxt = await fetchCP932(subjectUrl, base);
+    const r = await getVia(subjectUrl, { binary: true }); // CP932
+    if (r.status !== 200) return res.status(r.status).send('取得に失敗しました: SUBJECT_' + r.status);
+
+    const subjectTxt = iconv.decode(Buffer.from(r.data), 'cp932');
     const threads = parseSubjectTxt(subjectTxt);
 
     const list = threads.map(t => {
@@ -213,32 +188,30 @@ app.get('/board', async (req, res) => {
   }
 });
 
-/* ===== スレ本文（dat優先→失敗時read.cgiをサーバー側で解析） ===== */
+/* ===== スレ本文：dat優先 → ダメなら read.cgi ===== */
 app.get('/thread', async (req, res) => {
   try {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
     let dat  = (req.query.dat  || '').trim();
 
-    // /thread?url=https://.../dat/12345.dat でもOK
+    // /thread?url=.../dat/xxxx.dat でもOK
     if ((!base || !dat) && req.query.url) {
       try {
         const u = new URL(req.query.url);
         const [head, tail] = u.pathname.split('/dat/');
         base = base || `${u.protocol}//${u.host}${head}/`;
         dat  = dat  || (tail || '').replace('.dat','');
-      } catch (_) {}
+      } catch {}
     }
-    if (!base && DEFAULT_BASE && dat) base = DEFAULT_BASE;
     if (base && !base.endsWith('/')) base += '/';
-
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
-    // 1) dat直取得
-    try {
-      const datUrl = joinUrl(base, `dat/${dat}.dat`);
-      const datTxt = await fetchCP932(datUrl, base);
+    // 1) dat 直
+    const datUrl = joinUrl(base, `dat/${dat}.dat`);
+    const rDat = await getVia(datUrl, { binary: true });
+    if (rDat.status === 200) {
+      const datTxt = iconv.decode(Buffer.from(rDat.data), 'cp932');
       const posts = parseDat(datTxt);
-
       const html = posts.map(p => `
         <article>
           <div><b>${p.no}</b> 名前：${he.escape(p.name)} <span class="muted">[${he.escape(p.dateId)}]</span></div>
@@ -248,66 +221,57 @@ app.get('/thread', async (req, res) => {
 
       return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(dat)</title>
       <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
-      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
-      ${html || 'レスがありません'}`);
-    } catch (_errDat) {
-      // 2) read.cgi をサーバー側で取得し、外部遷移なしで描画
-      const readUrl = buildReadCgiUrl(base, dat);
-      const html = await fetchUtf8(readUrl, base);
-      const posts = parseReadCgiHtml(html);
-
-      const body = posts.map(p => `
-        <article>
-          <div><b>${p.no}</b> ${he.escape(p.name || '')} <span class="muted">${he.escape(p.dateId || '')}</span></div>
-          <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${he.escape(p.body || '')}</pre>
-        </article>
-      `).join('<hr>');
-
-      return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(read.cgi)</title>
-      <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
-      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
-      ${body || 'レスがありません'}`);
+      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>${html || 'レスがありません'}`);
     }
+
+    // 2) read.cgi 経由
+    const readUrl = buildReadCgiUrl(base, dat);
+    const rHtml = await getVia(readUrl, { binary: false });
+    if (rHtml.status !== 200) {
+      return res.status(rHtml.status).send('取得に失敗しました: READCGI_' + rHtml.status);
+    }
+
+    const posts = parseReadCgiHtml(typeof rHtml.data === 'string' ? rHtml.data : rHtml.data.toString('utf8'));
+    const body = posts.map(p => `
+      <article>
+        <div><b>${p.no}</b> ${he.escape(p.name || '')} <span class="muted">${he.escape(p.dateId || '')}</span></div>
+        <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${he.escape(p.body || '')}</pre>
+      </article>
+    `).join('<hr>');
+
+    return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(read.cgi)</title>
+    <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
+    <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>${body || 'レスがありません'}`);
   } catch (e) {
     res.status(500).send('取得に失敗しました: ' + he.escape(String(e.message || e)));
   }
 });
 
-/* ===== デバッグ: 実際に取りに行くdat URL確認 ===== */
-app.get('/__debug_thread_url', (req, res) => {
-  const base = (req.query.base || DEFAULT_BASE || '').trim();
-  const dat  = (req.query.dat  || '').trim();
-  if (!base || !dat) return res.status(400).send('base/dat 必須');
-  res.type('text').send(joinUrl(base, `dat/${dat}.dat`));
-});
-
-/* ===== 診断: dat / read.cgi のHTTPステータス可視化 ===== */
+/* ===== 診断（直叩きは行わず“必ずプロキシ経由”の状態を数値で確認） ===== */
 app.get('/__diag', async (req, res) => {
   try {
     const base = (req.query.base || DEFAULT_BASE || '').trim();
     const dat  = (req.query.dat  || '').trim();
     if (!base || !dat) return res.status(400).json({ error: 'need base & dat' });
 
+    const subjectUrl = joinUrl(base, 'subject.txt');
     const datUrl  = joinUrl(base, `dat/${dat}.dat`);
     const readUrl = buildReadCgiUrl(base, dat);
 
-    const r1 = await axios.get(datUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'User-Agent': UA, 'Range': 'bytes=0-', Referer: base },
-      timeout: 8000, validateStatus: s => true, httpAgent, httpsAgent,
-    }).then(r => ({ url: datUrl,  status: r.status, len: Number(r.headers['content-length']||0) }))
-      .catch(e => ({ url: datUrl,  error: String(e.message) }));
+    const [s, d, r] = await Promise.all([
+      getVia(subjectUrl, { binary:true }).then(x=>x.status).catch(()=>0),
+      getVia(datUrl,     { binary:true }).then(x=>x.status).catch(()=>0),
+      getVia(readUrl,    { binary:false}).then(x=>x.status).catch(()=>0),
+    ]);
 
-    const r2 = await axios.get(readUrl, {
-      responseType: 'text',
-      headers: { 'User-Agent': UA, Referer: base },
-      timeout: 8000, validateStatus: s => true, httpAgent, httpsAgent,
-    }).then(r => ({ url: readUrl, status: r.status, len: Number(r.headers['content-length']||0) }))
-      .catch(e => ({ url: readUrl, error: String(e.message) }));
-
-    res.json({ dat: r1, readcgi: r2 });
+    res.json({
+      proxy_url: PROXY_URL || null,
+      subject_status: s,
+      dat_status: d,
+      readcgi_status: r
+    });
   } catch (e) {
-    res.status(500).json({ error: String(e.message||e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
