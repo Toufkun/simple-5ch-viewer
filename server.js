@@ -132,7 +132,7 @@ app.get('/board', async (req, res) => {
 // スレ本文（dat）
 app.get('/thread', async (req, res) => {
   try {
-    const base = (req.query.base || DEFAULT_BASE || '').trim();
+    const base = (req.query.url || process.env.BASE_BOARD_URL || '').trim();
     const dat = (req.query.dat || '').trim();
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
