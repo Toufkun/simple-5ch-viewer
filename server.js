@@ -8,14 +8,14 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 
-// ====== 基本設定 ======
+// ===== 基本設定 =====
 const PORT = process.env.PORT || 3000;
 const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://asahi.5ch.net/newsplus/
-const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });   // 秒
-// 5chのdat取得で弾かれにくいUA
-const UA = 'Monazilla/1.00 JaneStyle/5.0.0';
+const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });  // 秒
+// 専ブラ互換UA（5chのdat取得で弾かれにくい）
+const UA = 'Monazilla/1.00 JaneStyle/4.0.0';
 
-// ---- レート制限 & 軽いセキュリティ ----
+// レート制限 & 軽いセキュリティ
 app.use(rateLimit({ windowMs: 60 * 1000, max: 30 }));
 app.use((_, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -23,7 +23,7 @@ app.use((_, res, next) => {
   next();
 });
 
-// ====== ユーティリティ ======
+// ===== ユーティリティ =====
 const joinUrl = (base, path) =>
   `${base.replace(/\/+$/,'')}/${path.replace(/^\/+/, '')}`;
 
@@ -38,15 +38,16 @@ async function fetchCP932(url, referer = DEFAULT_BASE) {
       'Accept': '*/*',
       'Accept-Language': 'ja-JP,ja;q=0.9',
       'Connection': 'close',
+      // dat取得で重要
+      'Range': 'bytes=0-',
       ...(referer ? { Referer: referer } : {})
     },
     timeout: 10000,
-    // 403/404 も捕捉して自前で扱う
-    validateStatus: s => s >= 200 && s < 500
+    validateStatus: s => s >= 200 && s < 500 // 403/404も扱う
   });
 
-  if (res.status === 404) throw new Error('DAT_404'); // 落ちスレ等
-  if (res.status === 403) throw new Error('DAT_403'); // アクセス拒否
+  if (res.status === 404) throw new Error('DAT_404');
+  if (res.status === 403) throw new Error('DAT_403');
 
   const text = iconv.decode(Buffer.from(res.data), 'cp932'); // Shift_JIS/CP932
   cache.set(url, text);
@@ -75,13 +76,12 @@ function parseDat(text) {
   });
 }
 
-// ====== 画面 ======
+// ===== 画面 =====
 app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
   <style>
     body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;line-height:1.6;padding:16px;max-width:940px;margin:auto}
-    input,button{font-size:16px;padding:6px 10px}.muted{color:#666}
-    a{word-break:break-all}
+    input,button{font-size:16px;padding:6px 10px}.muted{color:#666} a{word-break:break-all}
   </style>
   <h1>Simple 5ch Viewer</h1>
   <p class="muted">環境変数 <code>BASE_BOARD_URL</code> は ${DEFAULT_BASE ? '設定済み' : '未設定'}。</p>
@@ -123,7 +123,7 @@ app.get('/thread', async (req, res) => {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
     let dat  = (req.query.dat  || '').trim();
 
-    // フォールバック: /thread?url=https://.../dat/12345.dat も受け付け
+    // フォールバック: /thread?url=https://.../dat/12345.dat も受ける
     if ((!base || !dat) && req.query.url) {
       try {
         const u = new URL(req.query.url);
@@ -132,7 +132,7 @@ app.get('/thread', async (req, res) => {
         dat  = dat  || (tail || '').replace('.dat','');
       } catch (_) {}
     }
-    // さらに: datだけ来たら base を既定値で補完
+    // datだけ来たら既定のbaseで補完
     if (!base && DEFAULT_BASE && dat) base = DEFAULT_BASE;
     if (base && !base.endsWith('/')) base += '/';
 
@@ -156,12 +156,12 @@ app.get('/thread', async (req, res) => {
   } catch (e) {
     const msg = String(e.message || e);
     if (msg.includes('DAT_404')) return res.status(404).send('このスレは落ちている可能性があります（dat 404）。/board に戻って別スレでお試しください。');
-    if (msg.includes('DAT_403')) return res.status(403).send('アクセスが拒否されました（403）。時間を置くかUA/Refererを見直してください。');
+    if (msg.includes('DAT_403')) return res.status(403).send('アクセスが拒否されました（403）。時間を置くかUA/Referer/Rangeを見直してください。');
     res.status(500).send('取得に失敗しました: ' + he.escape(msg));
   }
 });
 
-// どのdat URLを取りに行くか確認するデバッグ用（必要なら利用）
+// デバッグ: 実際に取りに行くdat URL確認
 app.get('/__debug_thread_url', (req, res) => {
   const base = (req.query.base || DEFAULT_BASE || '').trim();
   const dat  = (req.query.dat  || '').trim();
