@@ -1,6 +1,7 @@
-// server.js — Simple 5ch Viewer (Render用 完成版 / キャッシュバグ修正済)
-// 必要ENV：PROXY_URL（例: https://xxxx.workers.dev/）
-// 任意ENV：BASE_BOARD_URL（例: https://mi.5ch.net/news4vip/）
+// server.js — Simple 5ch Viewer（完成版）
+// 目的: subject.txt / dat / read.cgi を Cloudflare Worker 経由で取得し、403や文字化けを回避
+// 必要ENV: PROXY_URL 例) https://xxxxxx.workers.dev/
+// 任意ENV: BASE_BOARD_URL 例) https://mi.5ch.net/news4vip/
 
 const express = require('express');
 const axios = require('axios');
@@ -14,9 +15,9 @@ const app = express();
 
 /* ===== 基本設定 ===== */
 const PORT = process.env.PORT || 3000;
-const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://mi.5ch.net/news4vip/
-const PROXY_URL = (process.env.PROXY_URL || '').replace(/\/+$/, ''); // 例: https://xxxx.workers.dev
-const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 }); // 秒
+const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim();        // 例: https://mi.5ch.net/news4vip/
+const PROXY_URL   = (process.env.PROXY_URL || '').replace(/\/+$/, ''); // 例: https://xxxx.workers.dev
+const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });         // 秒
 
 /* ===== 軽い防御 ===== */
 app.use(rateLimit({ windowMs: 60 * 1000, max: 30 }));
@@ -33,15 +34,41 @@ const joinUrl = (base, path) =>
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
   const board = u.pathname.replace(/\/+$/,'').split('/').pop();
+  // モバイル互換で弾かれづらい read.cgi 形式
   return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/?guid=ON`;
 }
 
-// ★修正ポイント：status と data をセットでキャッシュ・返却
+// ---- 文字コード判定＆デコード ----
+function sniffCharsetFromHeaders(headers = {}) {
+  const ct = (headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
+  const m = ct.match(/charset\s*=\s*([^;]+)/);
+  return m ? m[1].trim() : '';
+}
+function sniffCharsetFromHtmlHead(buf) {
+  const head = Buffer.from(buf).slice(0, 4096).toString('ascii'); // 先頭だけ暫定ASCII読み
+  const m = head.match(/charset\s*=\s*["']?\s*([a-zA-Z0-9_\-]+)/i);
+  return m ? m[1].toLowerCase() : '';
+}
+function normalizeCharset(cs) {
+  cs = (cs || '').toLowerCase();
+  if (/(shift[_\-]?jis|sjis|cp932)/.test(cs)) return 'cp932';
+  if (/(euc[_\-]?jp)/.test(cs)) return 'euc-jp';
+  if (/utf/.test(cs)) return 'utf-8';
+  return '';
+}
+function decodeHtmlBinary(binary, headers) {
+  const fromHdr  = normalizeCharset(sniffCharsetFromHeaders(headers));
+  const fromMeta = normalizeCharset(sniffCharsetFromHtmlHead(binary));
+  const cs = fromHdr || fromMeta || 'cp932'; // 5chはSJIS系既定
+  return iconv.decode(Buffer.from(binary), cs);
+}
+
+// ---- プロキシ経由GET（status/data/headersをまとめて返す & キャッシュ）----
 async function getVia(url, { binary=false, timeout=15000 } = {}) {
   const final = PROXY_URL ? `${PROXY_URL}?url=${encodeURIComponent(url)}` : url;
   const key = (binary ? 'bin:' : 'txt:') + final;
   const hit = cache.get(key);
-  if (hit) return hit; // {status, data}
+  if (hit) return hit; // { status, data, headers }
 
   const res = await axios.get(final, {
     responseType: binary ? 'arraybuffer' : 'text',
@@ -49,7 +76,7 @@ async function getVia(url, { binary=false, timeout=15000 } = {}) {
     validateStatus: s => s >= 200 && s < 600
   });
 
-  const pack = { status: res.status, data: res.data };
+  const pack = { status: res.status, data: res.data, headers: res.headers || {} };
   if (res.status === 200) cache.set(key, pack);
   return pack;
 }
@@ -128,7 +155,7 @@ function parseReadCgiHtml(html) {
     }
   }
 
-  // 最終保険：大枠テキスト
+  // 最終保険：大枠のテキストを分割
   if (items.length === 0) {
     const bulk = $('#res, #thread, .thread, .thre, #main, #m, .content').first().text().trim();
     if (bulk) {
@@ -190,7 +217,7 @@ app.get('/thread', async (req, res) => {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
     let dat  = (req.query.dat  || '').trim();
 
-    // /thread?url=.../dat/xxxx.dat でもOK
+    // /thread?url=.../dat/xxxx.dat でもOKにする
     if ((!base || !dat) && req.query.url) {
       try {
         const u = new URL(req.query.url);
@@ -202,7 +229,7 @@ app.get('/thread', async (req, res) => {
     if (base && !base.endsWith('/')) base += '/';
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
-    // 1) dat 直
+    // 1) dat直取得
     const datUrl = joinUrl(base, `dat/${dat}.dat`);
     const rDat = await getVia(datUrl, { binary: true });
     if (rDat.status === 200) {
@@ -220,14 +247,15 @@ app.get('/thread', async (req, res) => {
       <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>${html || 'レスがありません'}`);
     }
 
-    // 2) read.cgi 経由
+    // 2) read.cgi（バイナリ→charset判定decode）
     const readUrl = buildReadCgiUrl(base, dat);
-    const rHtml = await getVia(readUrl, { binary: false });
+    const rHtml = await getVia(readUrl, { binary: true });
     if (rHtml.status !== 200) {
       return res.status(rHtml.status).send('取得に失敗しました: READCGI_' + rHtml.status);
     }
+    const htmlText = decodeHtmlBinary(rHtml.data, rHtml.headers);
+    const posts = parseReadCgiHtml(htmlText);
 
-    const posts = parseReadCgiHtml(typeof rHtml.data === 'string' ? rHtml.data : rHtml.data.toString('utf8'));
     const body = posts.map(p => `
       <article>
         <div><b>${p.no}</b> ${he.escape(p.name || '')} <span class="muted">${he.escape(p.dateId || '')}</span></div>
@@ -243,7 +271,7 @@ app.get('/thread', async (req, res) => {
   }
 });
 
-/* ===== 診断（必ずプロキシ経由の状態を数値で確認） ===== */
+/* ===== 診断 ===== */
 app.get('/__diag', async (req, res) => {
   try {
     const base = (req.query.base || DEFAULT_BASE || '').trim();
@@ -257,7 +285,7 @@ app.get('/__diag', async (req, res) => {
     const [s, d, r] = await Promise.all([
       getVia(subjectUrl, { binary:true }).then(x=>x.status).catch(()=>0),
       getVia(datUrl,     { binary:true }).then(x=>x.status).catch(()=>0),
-      getVia(readUrl,    { binary:false}).then(x=>x.status).catch(()=>0),
+      getVia(readUrl,    { binary:true }).then(x=>x.status).catch(()=>0),
     ]);
 
     res.json({
