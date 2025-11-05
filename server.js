@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DEFAULT_BASE = process.env.BASE_BOARD_URL || ''; // 例: https://asahi.5ch.net/newsplus/
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 }); // 秒
-const UA = 'Simple5chViewer/1.0 (+contact:you@example.com)';
+const UA = 'Monazilla/1.00 JaneStyle/5.0.0';
 
 // IPあたりのリクエスト制限（安全側）
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
@@ -33,12 +33,14 @@ async function fetchCP932(url, referer = DEFAULT_BASE) {
   const hit = cache.get(url);
   if (hit) return hit;
   const res = await axios.get(url, {
-    responseType: 'arraybuffer',
-    headers: { 'User-Agent': UA, 'Accept': '*/*', ...(referer ? { Referer: referer } : {}) },
-    timeout: 10000,
-    validateStatus: s => s >= 200 && s < 400
-  });
-  const text = iconv.decode(Buffer.from(res.data), 'cp932'); // Shift_JIS/CP932
+      responseType: 'arraybuffer',
+      headers: { 'User-Agent': UA, 'Accept': '*/*', ...(referer ? { Referer: referer } : {}) },
+      timeout: 10000,
+    validateStatus: s => s >= 200 && s < 500
+    });
+  if (res.status === 404) throw new Error('404_DAT_NOT_FOUND');
+  if (res.status === 403) throw new Error('403_FORBIDDEN');
+  const text = iconv.decode(Buffer.from(res.data), 'cp932');
   cache.set(url, text);
   return text;
 }
@@ -137,7 +139,14 @@ app.get('/thread', async (req, res) => {
     <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
     ${html || 'レスがありません'}`);
   } catch (e) {
-    res.status(500).send('取得に失敗しました: ' + he.escape(e.message));
+    if (String(e.message).includes('404_DAT_NOT_FOUND')) {
+        return res.status(404).send('このスレは落ちている可能性があります（dat 404）。/board に戻って別スレでお試しください。');
+    }
+    if (String(e.message).includes('403_FORBIDDEN')) {
+        return res.status(403).send('アクセスが拒否されました（403）。少し時間を置くか、UA/Refererを変更して再試行してください。');
+    }
+    es.status(500).send('取得に失敗しました: ' + he.escape(e.message));
+  }
   }
 });
 
