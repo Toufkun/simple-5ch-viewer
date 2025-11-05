@@ -5,6 +5,7 @@ const iconv = require('iconv-lite');
 const NodeCache = require('node-cache');
 const he = require('he');
 const rateLimit = require('express-rate-limit');
+const cheerio = require('cheerio');
 
 const app = express();
 
@@ -12,7 +13,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim(); // 例: https://asahi.5ch.net/newsplus/
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });  // 秒
-// 専ブラ互換UA（5chのdat取得で弾かれにくい）
 const UA = 'Monazilla/1.00 JaneStyle/4.0.0';
 
 // レート制限 & 軽いセキュリティ
@@ -26,6 +26,12 @@ app.use((_, res, next) => {
 // ===== ユーティリティ =====
 const joinUrl = (base, path) =>
   `${base.replace(/\/+$/,'')}/${path.replace(/^\/+/, '')}`;
+
+function buildReadCgiUrl(base, dat) {
+  const u = new URL(base);
+  const boardName = u.pathname.replace(/\/+$/,'').split('/').pop();
+  return `${u.protocol}//${u.host}/test/read.cgi/${boardName}/${dat}/`;
+}
 
 async function fetchCP932(url, referer = DEFAULT_BASE) {
   const hit = cache.get(url);
@@ -54,6 +60,31 @@ async function fetchCP932(url, referer = DEFAULT_BASE) {
   return text;
 }
 
+async function fetchUtf8(url, referer = DEFAULT_BASE) {
+  const hit = cache.get(url);
+  if (hit) return hit;
+
+  const res = await axios.get(url, {
+    responseType: 'text',
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'text/html, */*;q=0.8',
+      'Accept-Language': 'ja-JP,ja;q=0.9',
+      'Connection': 'close',
+      ...(referer ? { Referer: referer } : {})
+    },
+    timeout: 10000,
+    validateStatus: s => s >= 200 && s < 500
+  });
+
+  if (res.status === 404) throw new Error('READCGI_404');
+  if (res.status === 403) throw new Error('READCGI_403');
+
+  const html = typeof res.data === 'string' ? res.data : res.data.toString('utf8');
+  cache.set(url, html);
+  return html;
+}
+
 function parseSubjectTxt(text) {
   // 1行: "1234567890.dat<>タイトル (123)"
   return text.split('\n').filter(Boolean).map(line => {
@@ -76,11 +107,46 @@ function parseDat(text) {
   });
 }
 
-function buildReadCgiUrl(base, dat) {
-  // base: https://mi.5ch.net/news4vip/ → boardName=news4vip
-  const u = new URL(base);
-  const boardName = u.pathname.replace(/\/+$/,'').split('/').pop();
-  return `${u.protocol}//${u.host}/test/read.cgi/${boardName}/${dat}/`;
+// read.cgi のHTMLから本文を抽出して自サイトで描画
+function parseReadCgiHtml(html) {
+  const $ = cheerio.load(html, { decodeEntities: false });
+  // 5chのread.cgiは構造が一定ではないが、本文は <div class="post"> や <dt>/<dd> ペアにあることが多い
+  // ここでは汎用的に、レスっぽい塊を抽出する。
+  let items = [];
+
+  // パターン1: 5ch現行の <article> や .post-like を拾う
+  $('article, .post, .postWrap').each((i, el) => {
+    const name = ($(el).find('.name').text() || $(el).find('.name a').text() || '').trim();
+    const dateId = ($(el).find('.date').text() || $(el).find('.info').text() || '').trim();
+    const bodyHtml = $(el).find('.message, .post-message, .body, .messageText').html() || $(el).find('blockquote').html() || $(el).html();
+    if (bodyHtml) {
+      items.push({
+        no: i + 1,
+        name,
+        dateId,
+        // HTML→テキスト寄りで描画（最低限の<br>→改行）
+        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
+      });
+    }
+  });
+
+  // パターン2: 古い <dt>/<dd> 構造
+  if (items.length === 0) {
+    const dts = $('dt');
+    const dds = $('dd');
+    for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
+      const head = $(dts[i]).text().trim(); // 番号 名前 日付ID など
+      const bodyHtml = $(dds[i]).html() || '';
+      items.push({
+        no: i + 1,
+        name: head,
+        dateId: '',
+        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
+      });
+    }
+  }
+
+  return items;
 }
 
 // ===== 画面 =====
@@ -124,7 +190,7 @@ app.get('/board', async (req, res) => {
   }
 });
 
-// スレ本文（dat）
+// スレ本文（dat優先→失敗時read.cgiパース）
 app.get('/thread', async (req, res) => {
   try {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
@@ -139,45 +205,46 @@ app.get('/thread', async (req, res) => {
         dat  = dat  || (tail || '').replace('.dat','');
       } catch (_) {}
     }
-    // datだけ来たら既定のbaseで補完
     if (!base && DEFAULT_BASE && dat) base = DEFAULT_BASE;
     if (base && !base.endsWith('/')) base += '/';
 
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
-    const datUrl = joinUrl(base, `dat/${dat}.dat`);
-    const datTxt = await fetchCP932(datUrl, base);
-    const posts = parseDat(datTxt);
+    // 1) dat直取得トライ
+    try {
+      const datUrl = joinUrl(base, `dat/${dat}.dat`);
+      const datTxt = await fetchCP932(datUrl, base);
+      const posts = parseDat(datTxt);
+      const html = posts.map(p => `
+        <article>
+          <div><b>${p.no}</b> 名前：${he.escape(p.name)} <span class="muted">[${he.escape(p.dateId)}]</span></div>
+          <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${p.body}</pre>
+        </article>
+      `).join('<hr>');
+      return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(dat)</title>
+      <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
+      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
+      ${html || 'レスがありません'}`);
+    } catch (errDat) {
+      // 2) 失敗（403/404等）→ read.cgi をサーバー側で取得してパース
+      const readUrl = buildReadCgiUrl(base, dat);
+      const html = await fetchUtf8(readUrl, base);
+      const posts = parseReadCgiHtml(html);
 
-    const html = posts.map(p => `
-      <article>
-        <div><b>${p.no}</b> 名前：${he.escape(p.name)} <span class="muted">[${he.escape(p.dateId)}]</span></div>
-        <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${p.body}</pre>
-      </article>
-    `).join('<hr>');
+      const body = posts.map(p => `
+        <article>
+          <div><b>${p.no}</b> ${he.escape(p.name || '')} <span class="muted">${he.escape(p.dateId || '')}</span></div>
+          <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${he.escape(p.body || '')}</pre>
+        </article>
+      `).join('<hr>');
 
-    res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文</title>
-    <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
-    <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
-    ${html || 'レスがありません'}`);
+      return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(read.cgi)</title>
+      <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
+      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
+      ${body || 'レスがありません'}`);
+    }
   } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes('DAT_404')) {
-      return res.status(404).send('このスレは落ちている可能性があります（dat 404）。/board に戻って別スレでお試しください。');
-    }
-    if (msg.includes('DAT_403')) {
-      // dat直取りが弾かれた → read.cgiへフォールバック
-      try {
-        const base = (req.query.base || DEFAULT_BASE || '').trim();
-        const dat  = (req.query.dat  || '').trim();
-        if (base && dat) {
-          const readUrl = buildReadCgiUrl(base, dat);
-          return res.redirect(readUrl);
-        }
-      } catch (_) {}
-      return res.status(403).send('アクセスが拒否されました（403）。read.cgi へのフォールバックに失敗しました。');
-    }
-    res.status(500).send('取得に失敗しました: ' + he.escape(msg));
+    res.status(500).send('取得に失敗しました: ' + he.escape(String(e.message || e)));
   }
 });
 
