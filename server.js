@@ -10,15 +10,12 @@ const app = express();
 
 // ====== 基本設定 ======
 const PORT = process.env.PORT || 3000;
-const DEFAULT_BASE = process.env.BASE_BOARD_URL || ''; // 例: https://example.test/board
+const DEFAULT_BASE = process.env.BASE_BOARD_URL || ''; // 例: https://asahi.5ch.net/newsplus/
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 }); // 秒
 const UA = 'Simple5chViewer/1.0 (+contact:you@example.com)';
 
 // IPあたりのリクエスト制限（安全側）
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1分
-  max: 30,             // 分あたり30リク
-});
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 app.use(limiter);
 
 // 軽いセキュリティヘッダ
@@ -32,18 +29,12 @@ app.use((_, res, next) => {
 function joinUrl(base, path) {
   return `${base.replace(/\/+$/,'')}/${path.replace(/^\/+/, '')}`;
 }
-
 async function fetchCP932(url, referer = DEFAULT_BASE) {
   const hit = cache.get(url);
   if (hit) return hit;
-
   const res = await axios.get(url, {
     responseType: 'arraybuffer',
-    headers: {
-      'User-Agent': UA,
-      'Accept': '*/*',
-      ...(referer ? { Referer: referer } : {})
-    },
+    headers: { 'User-Agent': UA, 'Accept': '*/*', ...(referer ? { Referer: referer } : {}) },
     timeout: 10000,
     validateStatus: s => s >= 200 && s < 400
   });
@@ -51,7 +42,6 @@ async function fetchCP932(url, referer = DEFAULT_BASE) {
   cache.set(url, text);
   return text;
 }
-
 function parseSubjectTxt(text) {
   // 1行: "1234567890.dat<>タイトル (123)"
   return text.split('\n').filter(Boolean).map(line => {
@@ -59,48 +49,34 @@ function parseSubjectTxt(text) {
     if (!file || !rest) return null;
     const dat = file.replace('.dat', '');
     const m = rest.match(/^(.*)\s\((\d+)\)\s*$/);
-    return {
-      dat,
-      title: m ? m[1] : rest,
-      resCount: m ? Number(m[2]) : null
-    };
+    return { dat, title: m ? m[1] : rest, resCount: m ? Number(m[2]) : null };
   }).filter(Boolean);
 }
-
 function parseDat(text) {
   // 1行=1レス: "name<>mail<>dateID<>body<>title"
-  const rows = text.split('\n').filter(Boolean);
-  return rows.map((line, idx) => {
-    const parts = line.split('<>');
-    const [name='', mail='', dateId='', bodyRaw='', title=''] = parts;
-    const body = he
-      .escape(bodyRaw)                 // HTMLエスケープ
-      .replace(/<br\s*\/?>/gi, '\n')   // <br> → 改行
-      .replace(/&gt;&gt;(\d+)/g, '>>$1'); // &gt;&gt;n → >>n
-    return { no: idx + 1, name, mail, dateId, body, title };
+  return text.split('\n').filter(Boolean).map((line, i) => {
+    const [name='', mail='', dateId='', bodyRaw=''] = line.split('<>');
+    const body = he.escape(bodyRaw)
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/&gt;&gt;(\d+)/g, '>>$1');
+    return { no: i + 1, name, mail, dateId, body };
   });
 }
 
 // ====== 画面 ======
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
-  <style>
-    body{font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; line-height:1.6; padding:16px; max-width:940px; margin:auto;}
-    input,button{font-size:16px;padding:6px 10px;}
-    .muted{color:#666}
-  </style>
+  <style>body{font-family:system-ui;-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;line-height:1.6;padding:16px;max-width:940px;margin:auto}
+  input,button{font-size:16px;padding:6px 10px}.muted{color:#666}</style>
   <h1>Simple 5ch Viewer</h1>
   <p class="muted">環境変数 <code>BASE_BOARD_URL</code> が ${DEFAULT_BASE ? '設定済み' : '未設定'}。</p>
   <form action="/board" method="get">
     <label>板URL：</label><br>
-    <input name="url" placeholder="https://example.test/board" style="width:480px" value="${he.escape(DEFAULT_BASE)}">
+    <input name="url" placeholder="https://asahi.5ch.net/newsplus/" style="width:480px" value="${he.escape(DEFAULT_BASE)}">
     <button>スレ一覧を表示</button>
-  </form>
-  <p class="muted">※ 取得方法・頻度は各種規約・robots.txtに従ってください。キャッシュ/レート制限は実装済み。</p>
-  `);
+  </form>`);
 });
-
-app.get('/healthz', (_, res) => res.type('text').send('ok'));
+app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
 // 板のスレ一覧（subject.txt）
 app.get('/board', async (req, res) => {
@@ -121,9 +97,7 @@ app.get('/board', async (req, res) => {
 
     res.send(`<!doctype html><meta charset="utf-8"><title>板一覧</title>
     <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}a{word-break:break-all}</style>
-    <h2>スレ一覧</h2>
-    ${list || 'なし'}
-    <p><a href="/">← 戻る</a></p>`);
+    <h2>スレ一覧</h2>${list || 'なし'}<p><a href="/">← 戻る</a></p>`);
   } catch (e) {
     res.status(500).send('取得に失敗しました: ' + he.escape(e.message));
   }
@@ -132,11 +106,21 @@ app.get('/board', async (req, res) => {
 // スレ本文（dat）
 app.get('/thread', async (req, res) => {
   try {
-    const base = (req.query.url || process.env.BASE_BOARD_URL || '').trim();
-    const dat = (req.query.dat || '').trim();
+    let base = (req.query.base || DEFAULT_BASE || '').trim();
+    let dat  = (req.query.dat  || '').trim();
+
+    // フォールバック: /thread?url=https://.../dat/12345.dat でも読めるように
+    if ((!base || !dat) && req.query.url) {
+      try {
+        const u = new URL(req.query.url);
+        const [head, tail] = u.pathname.split('/dat/');
+        base = `${u.protocol}//${u.host}${head}/`;
+        dat  = (tail || '').replace('.dat','');
+      } catch (_) {}
+    }
+
     if (!base || !dat) return res.status(400).send('base/dat パラメータ不足');
 
-    // dat直取得（read.cgi経由に切り替える場合はここを差し替え）
     const datUrl = joinUrl(base, `dat/${dat}.dat`);
     const datTxt = await fetchCP932(datUrl, base);
     const posts = parseDat(datTxt);
@@ -157,6 +141,4 @@ app.get('/thread', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log('listening on :' + PORT);
-});
+app.listen(PORT, () => console.log('listening on :' + PORT));
