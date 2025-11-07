@@ -1,6 +1,5 @@
-// server.js — Simple 5ch Viewer（完成版）
-// 目的: subject.txt / dat / read.cgi を Cloudflare Worker 経由で取得し、403や文字化けを回避
-// 必要ENV: PROXY_URL 例) https://xxxxxx.workers.dev/
+// server.js — Simple 5ch Viewer（完成版：403回避 + 文字コード自動判定 + ダークモード + アンカーリンク）
+// 必須ENV: PROXY_URL 例) https://xxxxxx.workers.dev/
 // 任意ENV: BASE_BOARD_URL 例) https://mi.5ch.net/news4vip/
 
 const express = require('express');
@@ -27,6 +26,84 @@ app.use((_, res, next) => {
   next();
 });
 
+/* ===== Dark theme（Charcoal）共通パーツ ===== */
+const THEME_STYLE = `
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #111111;
+    --muted: #666666;
+    --link: #0a58ff;
+    --card: #f7f7f8;
+    --border: #e5e7eb;
+  }
+  [data-theme="dark"] {
+    --bg: #131315;
+    --fg: #e5e7eb;
+    --muted: #a1a1aa;
+    --link: #83b7ff;
+    --card: #1a1b1e;
+    --border: #2a2b31;
+  }
+  html, body { background: var(--bg); color: var(--fg); }
+  body{
+    font-family: system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;
+    line-height: 1.6; padding: 16px; max-width: 940px; margin: auto;
+  }
+  a { color: var(--link); word-break: break-all; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--muted); }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px 14px;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+  pre {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .theme-toggle {
+    position: fixed; top: 12px; right: 12px; cursor: pointer;
+    font-size: 18px; background: var(--card); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 10px; line-height: 1;
+  }
+  .anc { text-decoration: underline dotted; }
+</style>
+`;
+
+const THEME_SCRIPT = `
+<script>
+(function(){
+  const saved = localStorage.getItem("theme");
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  if (saved === "dark" || (!saved && prefersDark)) {
+    document.documentElement.dataset.theme = "dark";
+  }
+  function setIcon(){
+    const btn = document.getElementById("theme-toggle");
+    if (!btn) return;
+    const dark = document.documentElement.dataset.theme === "dark";
+    btn.textContent = dark ? "☀️" : "🌙";
+    btn.setAttribute("aria-label", dark ? "ライトに切替" : "ダークに切替");
+  }
+  function toggle(){
+    const cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = cur;
+    localStorage.setItem("theme", cur);
+    setIcon();
+  }
+  document.addEventListener('DOMContentLoaded', function(){
+    const btn = document.createElement('button');
+    btn.id = 'theme-toggle'; btn.className = 'theme-toggle'; btn.onclick = toggle;
+    document.body.appendChild(btn);
+    setIcon();
+  });
+})();
+</script>
+`;
+
 /* ===== ユーティリティ ===== */
 const joinUrl = (base, path) =>
   `${base.replace(/\/+$/,'')}/${path.replace(/^\/+/, '')}`;
@@ -34,18 +111,17 @@ const joinUrl = (base, path) =>
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
   const board = u.pathname.replace(/\/+$/,'').split('/').pop();
-  // モバイル互換で弾かれづらい read.cgi 形式
   return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/?guid=ON`;
 }
 
-// ---- 文字コード判定＆デコード ----
+/* 文字コード判定＆デコード */
 function sniffCharsetFromHeaders(headers = {}) {
   const ct = (headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
   const m = ct.match(/charset\s*=\s*([^;]+)/);
   return m ? m[1].trim() : '';
 }
 function sniffCharsetFromHtmlHead(buf) {
-  const head = Buffer.from(buf).slice(0, 4096).toString('ascii'); // 先頭だけ暫定ASCII読み
+  const head = Buffer.from(buf).slice(0, 4096).toString('ascii');
   const m = head.match(/charset\s*=\s*["']?\s*([a-zA-Z0-9_\-]+)/i);
   return m ? m[1].toLowerCase() : '';
 }
@@ -59,16 +135,16 @@ function normalizeCharset(cs) {
 function decodeHtmlBinary(binary, headers) {
   const fromHdr  = normalizeCharset(sniffCharsetFromHeaders(headers));
   const fromMeta = normalizeCharset(sniffCharsetFromHtmlHead(binary));
-  const cs = fromHdr || fromMeta || 'cp932'; // 5chはSJIS系既定
+  const cs = fromHdr || fromMeta || 'cp932';
   return iconv.decode(Buffer.from(binary), cs);
 }
 
-// ---- プロキシ経由GET（status/data/headersをまとめて返す & キャッシュ）----
+/* プロキシ経由GET（status/data/headers & キャッシュ） */
 async function getVia(url, { binary=false, timeout=15000 } = {}) {
   const final = PROXY_URL ? `${PROXY_URL}?url=${encodeURIComponent(url)}` : url;
   const key = (binary ? 'bin:' : 'txt:') + final;
   const hit = cache.get(key);
-  if (hit) return hit; // { status, data, headers }
+  if (hit) return hit;
 
   const res = await axios.get(final, {
     responseType: binary ? 'arraybuffer' : 'text',
@@ -82,8 +158,12 @@ async function getVia(url, { binary=false, timeout=15000 } = {}) {
 }
 
 /* ===== 解析 ===== */
+function anchorizeEscapedText(txt) {
+  // 既に he.escape 済みのテキストに対して >>n を内部リンクへ
+  return txt.replace(/&gt;&gt;(\d+)/g, '<a class="anc" href="#r$1">&gt;&gt;$1</a>');
+}
+
 function parseSubjectTxt(s) {
-  // 1行: "1234567890.dat<>タイトル (123)"
   return s.split('\n').filter(Boolean).map(line => {
     const [file, rest] = line.split('<>');
     if (!file || !rest) return null;
@@ -94,11 +174,12 @@ function parseSubjectTxt(s) {
 }
 
 function parseDat(text) {
-  // 1行=1レス: "name<>mail<>dateID<>body<>title"
-  return text.split('\n').filter(Boolean).map((line, i) => {
+  const rows = text.split('\n').filter(Boolean);
+  return rows.map((line, idx) => {
     const [name='', mail='', dateId='', bodyRaw=''] = line.split('<>');
-    const body = he.escape(bodyRaw).replace(/<br\s*\/?>/gi, '\n').replace(/&gt;&gt;(\d+)/g, '>>$1');
-    return { no: i + 1, name, dateId, body };
+    const escaped = he.escape(bodyRaw).replace(/<br\s*\/?>/gi, '\n');  // ← 正しい形
+    const body = anchorizeEscapedText(escaped);
+    return { no: idx + 1, name, dateId, body };
   });
 }
 
@@ -127,16 +208,12 @@ function parseReadCgiHtml(html) {
       $(el).html();
 
     if (bodyHtml) {
-      items.push({
-        no: i + 1,
-        name,
-        dateId,
-        body: he.decode(
-          bodyHtml
-            .replace(/<br\s*\/?>/gi, '\n')
-            .replace(/<\/?[^>]+>/g, '')
-        )
-      });
+      // HTML → 素文 → エスケープ → >>n をアンカー化
+      const plain = bodyHtml
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/?[^>]+>/g, '');
+      const body = anchorizeEscapedText(he.escape(plain));
+      items.push({ no: i + 1, name, dateId, body });
     }
   });
 
@@ -145,21 +222,18 @@ function parseReadCgiHtml(html) {
     const dts = $('dt'); const dds = $('dd');
     for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
       const head = $(dts[i]).text().trim();
-      const bodyHtml = $(dds[i]).html() || '';
-      items.push({
-        no: i + 1,
-        name: head,
-        dateId: '',
-        body: he.decode(bodyHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, ''))
-      });
+      const plain = ( $(dds[i]).html() || '' ).replace(/<br\s*\/?>/gi, '\n').replace(/<\/?[^>]+>/g, '');
+      const body = anchorizeEscapedText(he.escape(plain));
+      items.push({ no: i + 1, name: head, dateId: '', body });
     }
   }
 
-  // 最終保険：大枠のテキストを分割
   if (items.length === 0) {
     const bulk = $('#res, #thread, .thread, .thre, #main, #m, .content').first().text().trim();
     if (bulk) {
-      return bulk.split(/\n{2,}/).map((t,i)=>({ no:i+1, name:'', dateId:'', body:t.trim() })).slice(0,200);
+      return bulk.split(/\n{2,}/).map((t,i)=>{
+        return { no:i+1, name:'', dateId:'', body: anchorizeEscapedText(he.escape(t.trim())) };
+      }).slice(0,200);
     }
   }
   return items;
@@ -168,19 +242,17 @@ function parseReadCgiHtml(html) {
 /* ===== 画面 ===== */
 app.get('/', (_req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Simple 5ch Viewer</title>
-  <style>
-    body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;line-height:1.6;padding:16px;max-width:940px;margin:auto}
-    input,button{font-size:16px;padding:6px 10px}
-    .muted{color:#666} a{word-break:break-all}
-  </style>
+  ${THEME_STYLE}
   <h1>Simple 5ch Viewer</h1>
   <p class="muted">BASE_BOARD_URL: <code>${he.escape(DEFAULT_BASE || '(未設定)')}</code></p>
   <p class="muted">PROXY_URL: <code>${he.escape(PROXY_URL || '(未設定)')}</code></p>
-  <form action="/board" method="get">
+  <form action="/board" method="get" class="card">
     <label>板URL：</label><br>
-    <input name="url" placeholder="https://mi.5ch.net/news4vip/" style="width:480px" value="${he.escape(DEFAULT_BASE)}">
-    <button>スレ一覧を表示</button>
-  </form>`);
+    <input name="url" placeholder="https://mi.5ch.net/news4vip/" style="width:480px;font-size:16px;padding:6px 10px">
+    <button style="font-size:16px;padding:6px 10px;margin-left:6px">スレ一覧を表示</button>
+  </form>
+  ${THEME_SCRIPT}
+  `);
 });
 
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
@@ -204,8 +276,14 @@ app.get('/board', async (req, res) => {
     }).join('');
 
     res.send(`<!doctype html><meta charset="utf-8"><title>板一覧</title>
-    <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}a{word-break:break-all}</style>
-    <h2>スレ一覧</h2>${list || 'なし'}<p><a href="/">← 戻る</a></p>`);
+${THEME_STYLE}
+<h2>スレ一覧</h2>
+<div class="card">
+  ${list || 'なし'}
+</div>
+<p style="margin-top:12px"><a href="/">← 戻る</a></p>
+${THEME_SCRIPT}
+`);
   } catch (e) {
     res.status(500).send('取得に失敗しました: ' + he.escape(String(e.message || e)));
   }
@@ -236,15 +314,18 @@ app.get('/thread', async (req, res) => {
       const datTxt = iconv.decode(Buffer.from(rDat.data), 'cp932');
       const posts = parseDat(datTxt);
       const html = posts.map(p => `
-        <article>
+        <article id="r${p.no}" class="card">
           <div><b>${p.no}</b> 名前：${he.escape(p.name)} <span class="muted">[${he.escape(p.dateId)}]</span></div>
-          <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${p.body}</pre>
+          <pre>${p.body}</pre>
         </article>
       `).join('<hr>');
 
       return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(dat)</title>
-      <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
-      <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>${html || 'レスがありません'}`);
+${THEME_STYLE}
+<p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
+${html || 'レスがありません'}
+${THEME_SCRIPT}
+`);
     }
 
     // 2) read.cgi（バイナリ→charset判定decode）
@@ -257,15 +338,18 @@ app.get('/thread', async (req, res) => {
     const posts = parseReadCgiHtml(htmlText);
 
     const body = posts.map(p => `
-      <article>
+      <article id="r${p.no}" class="card">
         <div><b>${p.no}</b> ${he.escape(p.name || '')} <span class="muted">${he.escape(p.dateId || '')}</span></div>
-        <pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 18px 0">${he.escape(p.body || '')}</pre>
+        <pre>${p.body || ''}</pre>
       </article>
     `).join('<hr>');
 
     return res.send(`<!doctype html><meta charset="utf-8"><title>スレ本文(read.cgi)</title>
-    <style>body{font-family:system-ui;padding:16px;max-width:940px;margin:auto}.muted{color:#666}</style>
-    <p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>${body || 'レスがありません'}`);
+${THEME_STYLE}
+<p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
+${body || 'レスがありません'}
+${THEME_SCRIPT}
+`);
   } catch (e) {
     res.status(500).send('取得に失敗しました: ' + he.escape(String(e.message || e)));
   }
