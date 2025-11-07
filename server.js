@@ -1,10 +1,10 @@
-// server.js — Simple 5ch Viewer（長い完全版）
+// server.js — Simple 5ch Viewer（完成版：スクショ風レス表示）
 // 収録機能：
 // - Cloudflare Worker 経由 (PROXY_URL) で403回避
 // - subject.txt → スレ一覧、dat → 本文、NGなら read.cgi に自動フォールバック
 // - 文字コード自動判定（UTF-8/CP932/EUC-JP）/ datはCP932
-// - ダークモード（チャコール）とトグル記憶
-// - レスは「本文だけ角丸ボックス」＋軽い影、メタは外側に表示
+// - ダークモード（トグル記憶）
+// - レスは「上にメタ行・下に角丸枠の本文ボックス」（影なし）
 // - >>アンカー内部リンク化
 // - 板メニュー：/menus（カテゴリタイル） /menus/c（カテゴリ内） /boards（検索UI）
 // - 診断API：/__diag
@@ -34,11 +34,11 @@ app.use((_, res, next) => {
   next();
 });
 
-/* ===== ダークテーマ（チャコール）＋ 角丸ボックス（本文だけ） ===== */
+/* ===== ダークテーマ ＋ スクショ風レス見た目 ===== */
 const THEME_STYLE = `
 <style>
-  :root { --bg:#ffffff; --fg:#111111; --muted:#666666; --link:#0a58ff; --card:#f7f7f8; --border:#e5e7eb; }
-  [data-theme="dark"] { --bg:#131315; --fg:#e5e7eb; --muted:#a1a1aa; --link:#83b7ff; --card:#1a1b1e; --border:#2a2b31; }
+  :root { --bg:#ffffff; --fg:#111111; --muted:#666666; --link:#0a58ff; --card:#f7f7f8; --border:#c9ccd4; }
+  [data-theme="dark"] { --bg:#131315; --fg:#e5e7eb; --muted:#a1a1aa; --link:#83b7ff; --card:#1a1b1e; --border:#3a3d46; }
 
   html, body { background: var(--bg); color: var(--fg); }
   body{
@@ -54,15 +54,23 @@ const THEME_STYLE = `
   }
   hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 
-  /* ===== レス（本文だけボックス） ===== */
-  .post{ margin:18px 0; }
-  .post .meta{ font-size:14px; margin:0 0 8px 2px; }
+  /* ===== レス表示（スクショ仕様） ===== */
+  .post{ margin:22px 0; }
+  .post .meta{
+    font-size:17px;
+    line-height:1.6;
+    margin:0 0 10px 0;
+  }
+  .post .meta .no{ font-weight:800; margin-right:.4rem; }
+  .post .meta .name{ font-weight:600; }
+  .post .meta .dtid{ color:var(--muted); }
+
   .post .bodybox{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 14px;           /* ← 角丸しっかり */
-    padding: 14px 16px;            /* ← 余白広め */
-    box-shadow: 0 2px 10px rgba(0,0,0,.06);  /* ← ほんのり影 */
+    background: transparent;
+    border: 2px solid var(--border);  /* 太めの枠線で入力欄っぽい雰囲気 */
+    border-radius: 12px;              /* 角丸 */
+    padding: 14px 16px;
+    box-shadow: none;                 /* 影は無し */
   }
   .post pre{
     background: transparent;
@@ -71,8 +79,8 @@ const THEME_STYLE = `
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
-    border-radius: inherit;        /* ← 角丸継承 */
-    overflow-wrap: anywhere;       /* ← 長いURLなどで角丸を壊さない */
+    border-radius: inherit;
+    overflow-wrap: anywhere;
   }
   .anc { text-decoration: underline dotted; }
 
@@ -137,12 +145,10 @@ const joinUrl = (base, path) =>
 function buildReadCgiUrl(base, dat) {
   const u = new URL(base);
   const board = u.pathname.replace(/\/+$/,'').split('/').pop();
-  // モバイル互換で弾かれづらい read.cgi 形式
   return `${u.protocol}//${u.host}/test/read.cgi/${board}/${dat}/?guid=ON`;
 }
 
 function anchorizeEscapedText(txt) {
-  // 既に he.escape 済みのテキストに対して >>n を内部リンクへ
   return txt.replace(/&gt;&gt;(\d+)/g, '<a class="anc" href="#r$1">&gt;&gt;$1</a>');
 }
 
@@ -153,7 +159,7 @@ function sniffCharsetFromHeaders(headers = {}) {
   return m ? m[1].trim() : '';
 }
 function sniffCharsetFromHtmlHead(buf) {
-  const head = Buffer.from(buf).slice(0, 4096).toString('ascii'); // 先頭だけ暫定ASCII読み
+  const head = Buffer.from(buf).slice(0, 4096).toString('ascii');
   const m = head.match(/charset\s*=\s*["']?\s*([a-zA-Z0-9_\-]+)/i);
   return m ? m[1].toLowerCase() : '';
 }
@@ -167,16 +173,16 @@ function normalizeCharset(cs) {
 function decodeHtmlBinary(binary, headers) {
   const fromHdr  = normalizeCharset(sniffCharsetFromHeaders(headers));
   const fromMeta = normalizeCharset(sniffCharsetFromHtmlHead(binary));
-  const cs = fromHdr || fromMeta || 'cp932'; // 5chはSJIS系既定
+  const cs = fromHdr || fromMeta || 'cp932';
   return iconv.decode(Buffer.from(binary), cs);
 }
 
-/* ---- プロキシ経由GET（status/data/headersを返す & キャッシュ）---- */
+/* ---- プロキシ経由GET（status/data/headers & キャッシュ）---- */
 async function getVia(url, { binary=false, timeout=15000 } = {}) {
   const final = PROXY_URL ? `${PROXY_URL}?url=${encodeURIComponent(url)}` : url;
   const key = (binary ? 'bin:' : 'txt:') + final;
   const hit = cache.get(key);
-  if (hit) return hit; // { status, data, headers }
+  if (hit) return hit;
 
   const res = await axios.get(final, {
     responseType: binary ? 'arraybuffer' : 'text',
@@ -203,7 +209,7 @@ function parseDat(text) {
   const rows = text.split('\n').filter(Boolean);
   return rows.map((line, idx) => {
     const [name='', mail='', dateId='', bodyRaw=''] = line.split('<>');
-    const escaped = he.escape(bodyRaw).replace(/<br\s*\/?>/gi, '\n');  // <br>→改行
+    const escaped = he.escape(bodyRaw).replace(/<br\s*\/?>/gi, '\n');
     const body = anchorizeEscapedText(escaped);
     return { no: idx + 1, name, dateId, body };
   });
@@ -243,7 +249,6 @@ function parseReadCgiHtml(html) {
     }
   });
 
-  // 古い dl 構造の保険
   if (items.length === 0) {
     const dts = $('dt'); const dds = $('dd');
     for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
@@ -354,12 +359,34 @@ ${THEME_SCRIPT}
 });
 
 /* ===== スレ本文：dat優先 → NGなら read.cgi ===== */
+function renderPostsHtml(posts, base){
+  return `<!doctype html><meta charset="utf-8"><title>本文</title>
+${THEME_STYLE}
+<p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
+${
+  posts.map(p => `
+    <article id="r${p.no}" class="post">
+      <div class="meta">
+        <span class="no">${p.no}</span>
+        <span class="name">${he.escape(p.name || '名無し')}</span>
+        <span class="dtid"> | ${he.escape(p.dateId || '')}</span>
+      </div>
+      <div class="bodybox">
+        <pre>${p.body || ''}</pre>
+      </div>
+    </article>
+  `).join('')
+ || 'レスがありません'}
+${THEME_SCRIPT}
+`;
+}
+
 app.get('/thread', async (req, res) => {
   try {
     let base = (req.query.base || DEFAULT_BASE || '').trim();
     let dat  = (req.query.dat  || '').trim();
 
-    // /thread?url=.../dat/xxxx.dat でもOKにする
+    // /thread?url=.../dat/xxxx.dat でもOK
     if ((!base || !dat) && req.query.url) {
       try {
         const u = new URL(req.query.url);
@@ -377,28 +404,10 @@ app.get('/thread', async (req, res) => {
     if (rDat.status === 200) {
       const datTxt = iconv.decode(Buffer.from(rDat.data), 'cp932');
       const posts = parseDat(datTxt);
-
-      const html = posts.map(p => `
-        <article id="r${p.no}" class="post">
-          <div class="meta">
-            <b>${p.no}</b> 名前：${he.escape(p.name)}
-            <span class="muted">[${he.escape(p.dateId)}]</span>
-          </div>
-          <div class="bodybox">
-            <pre>${p.body}</pre>
-          </div>
-        </article>
-      `).join('');
-
-      return res.send(`<!doctype html><meta charset="utf-8"><title>本文(dat)</title>
-${THEME_STYLE}
-<p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
-${html || 'レスがありません'}
-${THEME_SCRIPT}
-`);
+      return res.send(renderPostsHtml(posts, base));
     }
 
-    // 2) read.cgi（バイナリ→charset判定decode）
+    // 2) read.cgi
     const readUrl = buildReadCgiUrl(base, dat);
     const rHtml = await getVia(readUrl, { binary: true });
     if (rHtml.status !== 200) {
@@ -406,25 +415,7 @@ ${THEME_SCRIPT}
     }
     const htmlText = decodeHtmlBinary(rHtml.data, rHtml.headers);
     const posts = parseReadCgiHtml(htmlText);
-
-    const body = posts.map(p => `
-      <article id="r${p.no}" class="post">
-        <div class="meta">
-          <b>${p.no}</b> ${he.escape(p.name || '')}
-          <span class="muted">${he.escape(p.dateId || '')}</span>
-        </div>
-        <div class="bodybox">
-          <pre>${p.body || ''}</pre>
-        </div>
-      </article>
-    `).join('');
-
-    return res.send(`<!doctype html><meta charset="utf-8"><title>本文(read.cgi)</title>
-${THEME_STYLE}
-<p><a href="/board?url=${encodeURIComponent(base)}">← スレ一覧へ戻る</a></p>
-${body || 'レスがありません'}
-${THEME_SCRIPT}
-`);
+    return res.send(renderPostsHtml(posts, base));
   } catch (e) {
     res.status(500).send('取得に失敗しました: ' + he.escape(String(e.message || e)));
   }
