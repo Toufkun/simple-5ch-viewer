@@ -21,7 +21,7 @@ const app = express();
 
 /* ===== 基本設定 ===== */
 const PORT         = process.env.PORT || 3000;
-const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim();           // 例: https://mi.5ch.net/news4vip/
+const DEFAULT_BASE = (process.env.BASE_BOARD_URL || '').trim();           // 例: https://mi.5ch.io/news4vip/
 const PROXY_URL    = (process.env.PROXY_URL || '').replace(/\/+$/, '');   // 例: https://xxxx.workers.dev
 const BBSMENU_ENV  = (process.env.BBSMENU_URL || '').trim();
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 60 });
