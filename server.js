@@ -488,9 +488,9 @@ app.get('/menus', async (_req, res) => {
       </a>`;
     }).join('');
 
-    res.send(`<!doctype html><meta charset="utf-8"><title>板一覧 ＞ 5ch.net</title>
+    res.send(`<!doctype html><meta charset="utf-8"><title>板一覧 ＞ 5ch.io</title>
 ${THEME_STYLE}
-<div class="crumb">板一覧 &gt; 5ch.net</div>
+<div class="crumb">板一覧 &gt; 5ch.io</div>
 <div class="grid">${tiles}</div>
 <p style="margin-top:14px"><a href="/">← トップ</a></p>
 ${THEME_SCRIPT}
@@ -517,7 +517,7 @@ app.get('/menus/c', async (req, res) => {
         <span class="muted" style="font-size:12px;display:block">${he.escape(b.url)}</span>
       </div>`).join('');
 
-    res.send(`<!doctype html><meta charset="utf-8"><title>${he.escape(cat)} ＞ 5ch.net</title>
+    res.send(`<!doctype html><meta charset="utf-8"><title>${he.escape(cat)} ＞ 5ch.io</title>
 ${THEME_STYLE}
 <div class="crumb"><a href="/menus">板一覧</a> &gt; ${he.escape(cat)}</div>
 <div class="card">
