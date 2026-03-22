@@ -268,8 +268,8 @@ function parseReadCgiHtml(html) {
 /* ===== BBSMENU（カテゴリ → 板） ===== */
 const BBSMENU_CANDIDATES = [
   BBSMENU_ENV || null,
-  'https://menu.5ch.net/bbsmenu.html',
-  'https://menu.5ch.net/bbsmenu.html.gz',
+  'https://menu.5ch.io/bbsmenu.html',
+  'https://menu.5ch.io/bbsmenu.html.gz',
 ];
 async function fetchBbsMenuText() {
   for (const u of BBSMENU_CANDIDATES) {
@@ -311,7 +311,7 @@ ${THEME_STYLE}
 <p><a href="/menus">板一覧（カテゴリ）</a> ／ <a href="/boards">板一覧（検索）</a></p>
 <form action="/board" method="get" class="card" style="margin-top:10px">
   <label>板URL：</label><br>
-  <input name="url" placeholder="https://mi.5ch.net/news4vip/" style="width:480px;font-size:16px;padding:6px 10px">
+  <input name="url" placeholder="https://mi.5ch.io/news4vip/" style="width:480px;font-size:16px;padding:6px 10px">
   <button style="font-size:16px;padding:6px 10px;margin-left:6px">スレ一覧を表示</button>
 </form>
 ${THEME_SCRIPT}
